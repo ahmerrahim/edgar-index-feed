@@ -195,4 +195,205 @@ jobs:
             git commit -m 'Record refreshed public EDGAR index'
             git push
           fi
+      - name: Build the official issuer and financing reference
+        timeout-minutes: 2
+        env:
+          SEC_EDGAR_CONTACT: ${{ secrets.SEC_EDGAR_CONTACT }}
+        run: |
+          python3 - <<'REFERENCE_PY'
+          """Publish public SEC issuer identifiers and explicit recent financing terms."""
 
+          from datetime import datetime, timedelta, timezone
+          from gzip import open as gzip_open
+          from html import unescape
+          from html.parser import HTMLParser
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import time
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+
+
+          TODAY = datetime.now(timezone.utc).date()
+          TICKER_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
+          SEARCH_URL = "https://efts.sec.gov/LATEST/search-index?"
+          ARCHIVES = "https://www.sec.gov/Archives/"
+          ACCESSION = re.compile(r"^\d{10}-\d{2}-\d{6}$")
+          AMOUNT = r"((?:US|U\.S\.|C|CA|CAD|A|AUD|NZ|HK)?\$)\s*([\d,]+(?:\.\d+)?)\s*(billion|million|thousand)?"
+          SHARES = r"([\d,]+)\s+shares"
+          CLOSING = re.compile(
+              r"\b(?:announc\w+ (?:the |it had )?clos(?:ing|ed)|closed|completed|consummated)\b"
+              r"[^.!?;]{0,115}\b(?:offering|private placement|financing|credit facility)\b"
+              r"|\b(?:offering|private placement|financing|credit facility)\b[^.!?;]{0,75}"
+              r"\b(?:was|has been)\s+(?:closed|completed|consummated)\b", re.I
+          )
+          PROSPECTIVE = re.compile(r"\b(?:not|expect(?:s|ed)?\s+to|will|to be|subject to|if|intends? to|in order to)\b", re.I)
+
+          class FilingText(HTMLParser):
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.parts = []
+                  self.hidden = 0
+
+              def handle_starttag(self, tag, attrs):
+                  if tag in ("style", "script"):
+                      self.hidden += 1
+
+              def handle_endtag(self, tag):
+                  if tag in ("style", "script") and self.hidden:
+                      self.hidden -= 1
+
+              def handle_data(self, data):
+                  if not self.hidden:
+                      self.parts.append(data)
+
+              def text(self):
+                  return " ".join(unescape(" ".join(self.parts)).split())
+
+
+          def fetch(url, contact, cap=4_000_000):
+              request = Request(url, headers={
+                  "User-Agent": "Biotech Listings Tracker " + contact,
+                  "Accept-Encoding": "identity",
+                  "Accept": "application/json,text/html,*/*",
+              })
+              with urlopen(request, timeout=30) as response:
+                  body = response.read(cap + 1)
+              if len(body) > cap:
+                  raise ValueError("SEC response exceeded the size limit")
+              return body
+
+
+          def issuer_map(contact):
+              payload = json.loads(fetch(TICKER_URL, contact))
+              fields = payload["fields"]
+              order = [fields.index(col) for col in ("ticker", "cik", "name", "exchange")]
+              issuers = [[item[i] for i in order] for item in payload["data"]
+                         if item[order[0]] and item[order[1]]]
+              if len(issuers) < 1000:
+                  raise ValueError("Official SEC ticker map is incomplete")
+              return issuers
+
+
+          def latest_accessions():
+              filings = {}
+              cutoff = (TODAY - timedelta(days=8)).isoformat()
+              with gzip_open("/tmp/edgar-rolling.idx.gz", "rt", encoding="utf-8") as archive:
+                  for _ in range(3):
+                      next(archive)
+                  for line in archive:
+                      cik, name, form, day, path = line.strip().split("|")
+                      if form in ("8-K", "8-K/A", "6-K", "6-K/A") and day >= cutoff:
+                          accession = path.split("/")[-1].removesuffix(".txt")
+                          filings.setdefault(accession, []).append((cik, name, day, form))
+              return filings
+
+
+          def one_match(pattern, passage, amount=False):
+              seen = set()
+              for match in re.finditer(pattern, passage, re.I):
+                  if amount:
+                      raw = match[2].replace(",", "")
+                      units = {None: 1, "thousand": 1_000, "million": 1_000_000, "billion": 1_000_000_000}
+                      currency = {"US$": "USD", "U.S.$": "USD", "C$": "CAD", "CA$": "CAD", "CAD$": "CAD",
+                                  "A$": "AUD", "AUD$": "AUD", "NZ$": "NZD", "HK$": "HKD"}.get(match[1].upper(), "$ as stated")
+                      key = (match[3] or "").lower() or None
+                      seen.add((round(float(raw) * units[key], 2), currency))
+                  else:
+                      seen.add(int(match[1].replace(",", "")))
+              return seen.pop() if len(seen) == 1 else None
+
+
+          def closed_terms(text):
+              for closed in CLOSING.finditer(text):
+                  if PROSPECTIVE.search(text[max(0, closed.start() - 45):closed.end()]):
+                      continue
+                  nearby = text[max(0, closed.start() - 60):closed.end() + 1400]
+                  gross = one_match(r"gross proceeds\s+(?:were|of|totaled|amounted to|from the offering were|to the company were)\s+(?:approximately\s+)?" + AMOUNT, nearby, True)
+                  net = one_match(r"net proceeds\s+(?:were|of|totaled|amounted to|from the offering were|to the company were)\s+(?:approximately\s+)?" + AMOUNT, nearby, True)
+                  common = one_match(r"(?:issued and sold|sold|issued|offering of)\s+(?:an aggregate of\s+)?" + SHARES + r"\s+of\s+(?:the company's\s+)?common stock", nearby)
+                  warrants = one_match(r"warrants to purchase\s+(?:up to\s+|an aggregate of\s+)?" + SHARES, nearby)
+                  pre = one_match(SHARES + r"\s+(?:of common stock\s+)?(?:were\s+)?outstanding\s+immediately before (?:the financing|the offering|the closing)", nearby)
+                  stated = "gross proceeds" if gross is not None else "net proceeds" if net is not None else "equity securities"
+                  if all(value is None for value in (gross, net, common, warrants)):
+                      continue
+                  if gross and net and (gross[1] != net[1] or net[0] > gross[0]):
+                      net = None
+                  result = {"gross": gross[0] if gross else None, "net": net[0] if net else None,
+                            "currency": (gross or net or (None, ""))[1],
+                            "common": common, "warrants": warrants, "prior_shares": pre,
+                            "basis": "Closing language and " + stated + " disclosed"}
+                  if pre and common is not None and warrants is not None:
+                      result["max_share_increase"] = round((common + warrants) / pre, 6)
+                  return result
+              return None
+
+
+          def financing(contact):
+              known = latest_accessions()
+              params = urlencode({
+                  "q": '"announced the closing" OR "completed the offering" OR "closed the offering" OR "completed a private placement" OR "closed its public offering"',
+                  "forms": "8-K,6-K", "dateRange": "custom",
+                  "startdt": (TODAY - timedelta(days=8)).isoformat(), "enddt": TODAY.isoformat(),
+                  "from": 0, "size": 100,
+              })
+              hits = json.loads(fetch(SEARCH_URL + params, contact))["hits"]
+              total = hits["total"]["value"] if isinstance(hits["total"], dict) else hits["total"]
+              candidates = {}
+              for item in hits["hits"]:
+                  accession, sep, document = item.get("_id", "").partition(":")
+                  if not sep or not ACCESSION.fullmatch(accession) or not re.fullmatch(r"[A-Za-z0-9_.-]+\.html?", document):
+                      continue
+                  for cik, issuer, day, form in known.get(accession, []):
+                      candidates.setdefault((accession, cik), (issuer, day, form, document))
+              results = []
+              errors = []
+              limit = 24
+              for (accession, cik), (issuer, day, form, document) in list(candidates.items())[:limit]:
+                  url = f"{ARCHIVES}edgar/data/{cik}/{accession.replace('-', '')}/{document}"
+                  time.sleep(0.6)
+                  try:
+                      parser = FilingText()
+                      parser.feed(fetch(url, contact, 2_500_000).decode("utf-8", errors="replace"))
+                      terms = closed_terms(parser.text())
+                      if terms:
+                          results.append({"accession": accession, "cik": cik, "issuer": issuer,
+                                          "filed": day, "form": form, "url": url, **terms})
+                  except (OSError, ValueError) as error:
+                      errors.append(str(error)[:100])
+              status = ("Limited" if errors or len(candidates) > limit or total > len(hits["hits"])
+                        else "Complete")
+              return {"status": status, "candidate_count": len(candidates),
+                      "scanned": min(limit, len(candidates)), "failed": len(errors), "records": results}
+
+
+          def main():
+              contact = os.environ["SEC_EDGAR_CONTACT"]
+              mapping = issuer_map(contact)
+              try:
+                  cash = financing(contact)
+              except (OSError, ValueError, KeyError) as error:
+                  cash = {"status": "Unavailable", "candidate_count": 0, "scanned": 0, "failed": 0, "records": []}
+                  print("SEC financing text search unavailable:", exc_status(error))
+              records = cash.pop("records")
+              output = {"checked": TODAY.isoformat(), "issuers": mapping, "financing": cash,
+                        "closed_financings": records}
+              Path("/tmp/edgar-reference.json").write_text(json.dumps(output, separators=(",", ":")), encoding="utf-8")
+              print(f"{len(mapping):,} official ticker entries; financing scan {cash['status']}, "
+                    f"{cash['scanned']} screened and {len(records)} supported closing disclosures.")
+
+
+          def exc_status(error):
+              code = getattr(error, "code", "")
+              return f"HTTP {code}" if code else type(error).__name__
+
+
+          if __name__ == "__main__":
+              main()
+          REFERENCE_PY
+      - name: Publish the public issuer and financing reference
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload edgar-index /tmp/edgar-reference.json --clobber
