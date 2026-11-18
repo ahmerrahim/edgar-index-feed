@@ -15,7 +15,7 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 17
     steps:
       - uses: actions/checkout@v6
       - name: Fetch and validate the official SEC archive
@@ -195,15 +195,23 @@ jobs:
             git commit -m 'Record refreshed public EDGAR index'
             git push
           fi
-      - name: Build the official issuer and financing reference
-        timeout-minutes: 2
+      - name: Reuse the previous public filing screen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release download edgar-index --pattern edgar-reference.json \
+            --output /tmp/previous-edgar-reference.json || true
+      - name: Screen recent public SEC filings
+        timeout-minutes: 13
         env:
           SEC_EDGAR_CONTACT: ${{ secrets.SEC_EDGAR_CONTACT }}
         run: |
           python3 - <<'REFERENCE_PY'
           """Publish public SEC issuer identifiers and explicit recent financing terms."""
 
-          from datetime import datetime, timedelta, timezone
+          from calendar import monthrange
+          from datetime import date, datetime, timedelta, timezone
           from gzip import open as gzip_open
           from html import unescape
           from html.parser import HTMLParser
@@ -212,13 +220,13 @@ jobs:
           from pathlib import Path
           import re
           import time
-          from urllib.parse import urlencode
+          from concurrent.futures import ThreadPoolExecutor
+          from threading import Lock
           from urllib.request import Request, urlopen
 
 
           TODAY = datetime.now(timezone.utc).date()
           TICKER_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
-          SEARCH_URL = "https://efts.sec.gov/LATEST/search-index?"
           ARCHIVES = "https://www.sec.gov/Archives/"
           ACCESSION = re.compile(r"^\d{10}-\d{2}-\d{6}$")
           AMOUNT = r"((?:US|U\.S\.|C|CA|CAD|A|AUD|NZ|HK)?\$)\s*([\d,]+(?:\.\d+)?)\s*(billion|million|thousand)?"
@@ -238,7 +246,7 @@ jobs:
                   self.hidden = 0
 
               def handle_starttag(self, tag, attrs):
-                  if tag in ("style", "script"):
+                  if tag in ("style", "script", "ix:header"):
                       self.hidden += 1
 
               def handle_endtag(self, tag):
@@ -277,18 +285,103 @@ jobs:
               return issuers
 
 
-          def latest_accessions():
+          LOOKBACK = 9
+          MAX_DOWNLOADS = 600
+          CURRENT_FORMS = {"8-K", "6-K"}
+          PERIODIC_FORMS = {"10-Q", "10-K", "20-F", "40-F"}
+          ALLOWED_EXCHANGES = {"nasdaq", "nyse", "nyse american", "nyse arca", "cboe"}
+          FILING_PATH = re.compile(r"edgar/data/\d+/\d{10}-\d{2}-\d{6}\.txt", re.I)
+          DOCUMENT = re.compile(r"<DOCUMENT>\s*(.*?)</DOCUMENT>", re.I | re.S)
+          MONTHS = "January February March April May June July August September October November December".split()
+          MONTH_PATTERN = "|".join(MONTHS)
+          CASH = r"(?:cash(?: and cash equivalents)?|liquidity|financial resources|cash runway|available capital)"
+          OPERATIONS = r"(?:fund|finance|support|cover|meet|enable)\b[^.!?;]{0,105}\b(?:operations|operating|expenditures|expenses|capital requirements|cash requirements|cash needs|working capital)"
+          HORIZON = re.compile(
+              rf"(?P<direction>through(?: at least)?|into(?: at least)?|until|(?:at least )?to)\s+(?:the\s+)?"
+              rf"(?P<period>(?:(?:end|beginning) of\s+)?(?:first|second|third|fourth) quarter (?:of )?20\d\d"
+              rf"|(?:first|second) half (?:of )?20\d\d|(?:Q[1-4]|H[12])\s+20\d\d|"
+              rf"(?:{MONTH_PATTERN})\s+(?:[1-3]?\d,?\s+)?20\d\d|(?:the year[- ]end of |the end of |year[- ]end |end of )?20\d\d)\b",
+              re.I
+          )
+          CONDITIONAL = re.compile(
+              r"\b(?:assum(?:es?|ing)|depend(?:s|ent|ing) on|subject to|includ(?:es?|ing)|together with|"
+              r"taking into account|along with|combined with|factoring in)\b[^.;]{0,140}"
+              r"\b(?:milestones?|anticipated|expected|future|potential|conditional|receipt of|proceeds from an? additional)\b",
+              re.I
+          )
+
+
+          def latest_accessions(issuers):
+              listed = {str(cik) for _, cik, _, exchange in issuers if str(exchange).lower() in ALLOWED_EXCHANGES}
               filings = {}
-              cutoff = (TODAY - timedelta(days=8)).isoformat()
+              cutoff = (TODAY - timedelta(days=LOOKBACK)).isoformat()
               with gzip_open("/tmp/edgar-rolling.idx.gz", "rt", encoding="utf-8") as archive:
-                  for _ in range(3):
-                      next(archive)
+                  source = json.loads(next(archive).split(": ", 1)[1])
+                  next(archive)
+                  next(archive)
                   for line in archive:
-                      cik, name, form, day, path = line.strip().split("|")
-                      if form in ("8-K", "8-K/A", "6-K", "6-K/A") and day >= cutoff:
-                          accession = path.split("/")[-1].removesuffix(".txt")
-                          filings.setdefault(accession, []).append((cik, name, day, form))
-              return filings
+                      cik, _, form, filed, path = line.strip().split("|")
+                      if cik not in listed or filed < cutoff or filed > source["published"] or not FILING_PATH.fullmatch(path):
+                          continue
+                      if form.removesuffix("/A") not in CURRENT_FORMS | PERIODIC_FORMS:
+                          continue
+                      accession = Path(path).stem
+                      filings.setdefault((accession, cik), (filed, form, path))
+              return source, cutoff, filings
+
+
+          def calendar_horizon(match):
+              direction, value = match["direction"].lower(), match["period"].lower()
+              year = int(value[-4:])
+              lower_bound = direction.startswith("into") or "beginning" in value
+              month, span = 1, 12
+              quarter = re.search(r"q([1-4])", value)
+              if "quarter" in value or quarter:
+                  order = ("first", "second", "third", "fourth")
+                  index = int(quarter[1]) - 1 if quarter else next(i for i, name in enumerate(order) if name in value)
+                  month, span = (index * 3) + 1, 3
+              elif "half" in value or value.startswith(("h1", "h2")):
+                  month, span = (7 if value.startswith(("second", "h2")) else 1), 6
+              else:
+                  for index, name in enumerate(MONTHS, 1):
+                      if value.startswith(name.lower()):
+                          month, span = index, 1
+                          day = re.match(r"\w+ ([1-3]?\d),? 20\d\d", value)
+                          if day:
+                              try:
+                                  return date(year, month, int(day[1])).isoformat()
+                              except ValueError:
+                                  return None
+                          break
+              if lower_bound and not value.startswith(("end of", "the end of", "year-end", "year end")):
+                  return date(year, month, 1).isoformat()
+              end_month = month + span - 1
+              return date(year, end_month, monthrange(year, end_month)[1]).isoformat()
+
+
+          def runway_terms(text, filed):
+              sentences = re.split(r"(?<=[!?])\s+|(?<=\.)\s+(?=[A-Z])", text)
+              matches = {}
+              for section in sentences:
+                  if len(section) > 1800 or not re.search(CASH, section, re.I):
+                      continue
+                  if re.search(r"\b(?:was expected|previously expected|no longer expects|not (?:be )?sufficient|"
+                               r"might not be sufficient|not sufficient|if we (?:raise|obtain))\b", section, re.I):
+                      continue
+                  horizon = HORIZON.search(section)
+                  context = section[:horizon.start()] if horizon else ""
+                  if not (re.search(OPERATIONS, context, re.I) or re.search(r"\bcash runway\b", context, re.I)):
+                      continue
+                  date_text = calendar_horizon(horizon)
+                  if not date_text or not filed < date_text <= str(int(filed[:4]) + 6) + "-12-31":
+                      continue
+                  evidence = section.strip()
+                  if len(evidence) > 540:
+                      continue
+                  candidate = {"through": date_text, "published": horizon[0], "conditional": bool(CONDITIONAL.search(evidence)),
+                               "evidence": evidence}
+                  matches[date_text] = candidate
+              return list(matches.values())
 
 
           def one_match(pattern, passage, amount=False):
@@ -331,58 +424,109 @@ jobs:
               return None
 
 
-          def financing(contact):
-              known = latest_accessions()
-              params = urlencode({
-                  "q": '"announced the closing" OR "completed the offering" OR "closed the offering" OR "completed a private placement" OR "closed its public offering"',
-                  "forms": "8-K,6-K", "dateRange": "custom",
-                  "startdt": (TODAY - timedelta(days=8)).isoformat(), "enddt": TODAY.isoformat(),
-                  "from": 0, "size": 100,
-              })
-              hits = json.loads(fetch(SEARCH_URL + params, contact))["hits"]
-              total = hits["total"]["value"] if isinstance(hits["total"], dict) else hits["total"]
-              candidates = {}
-              for item in hits["hits"]:
-                  accession, sep, document = item.get("_id", "").partition(":")
-                  if not sep or not ACCESSION.fullmatch(accession) or not re.fullmatch(r"[A-Za-z0-9_.-]+\.html?", document):
+          def scan_filing(key, filing, fetch_slot):
+              accession, cik = key
+              filed, form, path = filing
+              record = {"accession": accession, "cik": cik, "filed": filed, "form": form,
+                        "url": ARCHIVES + path, "status": "Review needed"}
+              try:
+                  body = fetch_slot(path).decode("utf-8", errors="replace")
+              except (OSError, ValueError) as error:
+                  record["issue"] = exc_status(error)
+                  return record
+              records = []
+              cash = []
+              seen = 0
+              for block in DOCUMENT.findall(body):
+                  kind = re.search(r"^<TYPE>([^\r\n]+)", block, re.M | re.I)
+                  filename = re.search(r"^<FILENAME>([^\r\n]+)", block, re.M | re.I)
+                  payload = re.search(r"<TEXT>(.*?)</TEXT>", block, re.S | re.I)
+                  if not kind or not filename or not payload:
                       continue
-                  for cik, issuer, day, form in known.get(accession, []):
-                      candidates.setdefault((accession, cik), (issuer, day, form, document))
-              results = []
-              errors = []
-              limit = 24
-              for (accession, cik), (issuer, day, form, document) in list(candidates.items())[:limit]:
-                  url = f"{ARCHIVES}edgar/data/{cik}/{accession.replace('-', '')}/{document}"
-                  time.sleep(0.6)
-                  try:
-                      parser = FilingText()
-                      parser.feed(fetch(url, contact, 2_500_000).decode("utf-8", errors="replace"))
-                      terms = closed_terms(parser.text())
+                  kind, filename = kind[1].strip().upper(), filename[1].strip()
+                  if kind != form and not re.fullmatch(r"EX-99(?:\.\d+)?", kind):
+                      continue
+                  if not re.fullmatch(r"[A-Za-z0-9_.-]+\.(?:html?|txt)", filename):
+                      continue
+                  if kind == form:
+                      seen += 1
+                  url = f"{ARCHIVES}edgar/data/{cik}/{accession.replace('-', '')}/{filename}"
+                  parser = FilingText()
+                  parser.feed(payload[1])
+                  text = parser.text().replace("’", "'")
+                  if form.removesuffix("/A") in CURRENT_FORMS:
+                      terms = closed_terms(text)
                       if terms:
-                          results.append({"accession": accession, "cik": cik, "issuer": issuer,
-                                          "filed": day, "form": form, "url": url, **terms})
-                  except (OSError, ValueError) as error:
-                      errors.append(str(error)[:100])
-              status = ("Limited" if errors or len(candidates) > limit or total > len(hits["hits"])
-                        else "Complete")
-              return {"status": status, "candidate_count": len(candidates),
-                      "scanned": min(limit, len(candidates)), "failed": len(errors), "records": results}
+                          records.append({"url": url, **terms})
+                  cash.extend({"url": url, **term} for term in runway_terms(text, filed))
+              if not seen:
+                  record["issue"] = "Primary text missing"
+                  return record
+              record["status"] = "Screened"
+              if records:
+                  # Prefer the source that explicitly reports the most terms.
+                  record["closing"] = max(records, key=lambda x: sum(x.get(field) is not None for field in
+                                           ("gross", "net", "common", "warrants", "prior_shares")))
+              horizons = {item["through"] for item in cash}
+              if len(horizons) == 1:
+                  record["runway"] = sorted(cash, key=lambda x: (not x["conditional"], len(x["evidence"])))[0]
+              elif horizons:
+                  record["runway_review"] = "More than one explicit runway horizon in the filing and exhibits"
+              return record
+
+
+          def review(issuers, contact):
+              source, start, filings = latest_accessions(issuers)
+              previous = Path("/tmp/previous-edgar-reference.json")
+              try:
+                  cache = json.loads(previous.read_text(encoding="utf-8")).get("review", {})
+                  if cache.get("version") != 2:
+                      cache = {}
+              except (OSError, ValueError):
+                  cache = {}
+              kept = {(row["accession"], row["cik"]): row for row in cache.get("filings", [])
+                      if row.get("status") == "Screened" and (row["accession"], row["cik"]) in filings}
+              todo = [(key, value) for key, value in sorted(filings.items(), key=lambda pair: pair[1][0], reverse=True)
+                      if key not in kept]
+              gate = Lock()
+              next_request = 0.0
+
+              def fetch_slot(path):
+                  nonlocal next_request
+                  with gate:
+                      time.sleep(max(0, next_request - time.monotonic()))
+                      next_request = time.monotonic() + 0.37
+                  return fetch(ARCHIVES + path, contact, 7_000_000)
+
+              with ThreadPoolExecutor(max_workers=5) as pool:
+                  incoming = list(pool.map(lambda job: scan_filing(*job, fetch_slot), todo[:MAX_DOWNLOADS]))
+              kept.update({(row["accession"], row["cik"]): row for row in incoming})
+              for key, (filed, form, path) in todo[MAX_DOWNLOADS:]:
+                  kept[key] = {"accession": key[0], "cik": key[1], "filed": filed, "form": form,
+                               "url": ARCHIVES + path, "status": "Queued"}
+              records = list(kept.values())
+              screened = sum(row["status"] == "Screened" for row in records)
+              return {"version": 2, "start": start, "through": source["published"], "missing": source.get("missing", []),
+                      "filings": records, "eligible": len(records), "screened": screened,
+                      "pending": len(records) - screened, "requests": len(incoming)}
 
 
           def main():
               contact = os.environ["SEC_EDGAR_CONTACT"]
               mapping = issuer_map(contact)
-              try:
-                  cash = financing(contact)
-              except (OSError, ValueError, KeyError) as error:
-                  cash = {"status": "Unavailable", "candidate_count": 0, "scanned": 0, "failed": 0, "records": []}
-                  print("SEC financing text search unavailable:", exc_status(error))
-              records = cash.pop("records")
-              output = {"checked": TODAY.isoformat(), "issuers": mapping, "financing": cash,
-                        "closed_financings": records}
+              results = review(mapping, contact)
+              closings = [{key: row[key] for key in ("accession", "cik", "filed", "form")} | row["closing"]
+                          for row in results["filings"] if "closing" in row]
+              output = {"checked": TODAY.isoformat(), "issuers": mapping, "review": results,
+                        "financing": {"status": "Limited" if results["pending"] or results["missing"] else "Complete",
+                                      "candidate_count": results["eligible"], "scanned": results["screened"],
+                                      "failed": results["pending"]},
+                        "closed_financings": closings}
               Path("/tmp/edgar-reference.json").write_text(json.dumps(output, separators=(",", ":")), encoding="utf-8")
-              print(f"{len(mapping):,} official ticker entries; financing scan {cash['status']}, "
-                    f"{cash['scanned']} screened and {len(records)} supported closing disclosures.")
+              runway = sum("runway" in row for row in results["filings"])
+              print(f"{len(mapping):,} official ticker entries; {results['screened']}/{results['eligible']} public filings screened, "
+                    f"{results['requests']} fresh requests, {len(closings)} closings and {runway} explicit runway statements; "
+                    f"archive through {results['through']}.")
 
 
           def exc_status(error):
