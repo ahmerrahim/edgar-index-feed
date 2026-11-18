@@ -292,7 +292,7 @@ jobs:
           MAX_DOWNLOADS = 600
           PARSER_VERSION = 4
           PACKAGE_LIMIT = 7_000_000
-          MAX_INDEX_REQUESTS = 220
+          MAX_INDEX_REQUESTS = 400
           MAX_EXHIBITS = 5
           CURRENT_FORMS = {"8-K", "6-K"}
           PERIODIC_FORMS = {"10-Q", "10-K", "20-F", "40-F"}
@@ -629,18 +629,20 @@ jobs:
                   (_, cik), (filed, _, _, matching_name) = item
                   return cik in classified or matching_name, filed
 
-              kept, previous_oversize = {}, set()
+              kept, previous_oversize, deferred = {}, set(), set()
               for row in cache.get("filings", []):
                   key = row["accession"], row["cik"]
                   if key not in filings:
                       continue
                   if row.get("status") == "Screened":
                       kept[key] = row
-                  elif row.get("issue", "").startswith("Primary text screened"):
+                  elif row.get("issue", "").startswith("Primary text screened") or row.get("method") == "Individual SEC documents":
                       previous_oversize.add(key)
+                      if "budget reached" in row.get("issue", ""):
+                          deferred.add(key)
 
               backlog = [(key, filings[key]) for key in previous_oversize]
-              backlog.sort(key=lambda pair: (not priority(pair)[0], pair[1][0], pair[0]))
+              backlog.sort(key=lambda pair: (not priority(pair)[0], pair[0] not in deferred, pair[1][0], pair[0]))
               ordinary = [(key, value) for key, value in sorted(filings.items(), key=priority, reverse=True)
                           if key not in kept and key not in previous_oversize]
               todo = backlog + ordinary
