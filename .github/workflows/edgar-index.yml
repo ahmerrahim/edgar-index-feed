@@ -264,7 +264,7 @@ jobs:
                   return " ".join(unescape(" ".join(self.parts)).split())
 
 
-          def fetch(url, contact, cap=4_000_000):
+          def fetch(url, contact, cap=4_000_000, allow_prefix=False):
               request = Request(url, headers={
                   "User-Agent": "Biotech Listings Tracker " + contact,
                   "Accept-Encoding": "identity",
@@ -272,7 +272,7 @@ jobs:
               })
               with urlopen(request, timeout=30) as response:
                   body = response.read(cap + 1)
-              if len(body) > cap:
+              if len(body) > cap and not allow_prefix:
                   raise ValueError("SEC response exceeded the size limit")
               return body
 
@@ -290,6 +290,7 @@ jobs:
 
           LOOKBACK = 9
           MAX_DOWNLOADS = 600
+          PARSER_VERSION = 3
           CURRENT_FORMS = {"8-K", "6-K"}
           PERIODIC_FORMS = {"10-Q", "10-K", "20-F", "40-F"}
           ALLOWED_EXCHANGES = {"nasdaq", "nyse", "nyse american", "nyse arca", "cboe"}
@@ -305,7 +306,7 @@ jobs:
               rf"(?P<direction>through(?: at least)?|into(?: at least)?|until|(?:at least )?to)\s+(?:the\s+)?"
               rf"(?P<period>(?:(?:end|beginning) of\s+)?(?:first|second|third|fourth) quarter (?:of )?20\d\d"
               rf"|(?:first|second) half (?:of )?20\d\d|(?:Q[1-4]|H[12])\s+20\d\d|"
-              rf"(?:{MONTH_PATTERN})\s+(?:[1-3]?\d,?\s+)?20\d\d|(?:the year[- ]end of |the end of |year[- ]end |end of )?20\d\d)\b",
+              rf"(?:{MONTH_PATTERN})\s+(?:[1-3]?\d,?\s+)?20\d\d|(?:the year[- ]end of |the end of |year[- ]end |end of |early |mid[- ]|late )?20\d\d)\b",
               re.I
           )
           CONDITIONAL = re.compile(
@@ -340,6 +341,12 @@ jobs:
               year = int(value[-4:])
               lower_bound = direction.startswith("into") or "beginning" in value
               month, span = 1, 12
+              if value.startswith("early "):
+                  month, span = 1, 3
+              elif value.startswith(("mid ", "mid-")):
+                  month, span = 4, 6
+              elif value.startswith("late "):
+                  month, span = 10, 3
               quarter = re.search(r"q([1-4])", value)
               if "quarter" in value or quarter:
                   order = ("first", "second", "third", "fourth")
@@ -367,10 +374,12 @@ jobs:
           def runway_terms(text, filed):
               sentences = re.split(r"(?<=[!?])\s+|(?<=\.)\s+(?=[A-Z])", text)
               matches = {}
-              for section in sentences:
-                  if len(section) > 1800 or not re.search(CASH, section, re.I):
+              for i, section in enumerate(sentences):
+                  prior = sentences[i - 1] if i and len(sentences[i - 1]) <= 300 else ""
+                  referred_cash = re.search(r"\b(?:these funds|such funds|those funds)\b", section, re.I) and re.search(CASH, prior, re.I)
+                  if len(section) > 1800 or not (re.search(CASH, section, re.I) or referred_cash):
                       continue
-                  if re.search(r"\b(?:was expected|previously expected|no longer expects|not (?:be )?sufficient|"
+                  if re.search(r"\b(?:may be insufficient|might be insufficient|could be insufficient|was expected|previously expected|no longer expects|not (?:be )?sufficient|"
                                r"might not be sufficient|not sufficient|if we (?:raise|obtain))\b", section, re.I):
                       continue
                   horizon = HORIZON.search(section)
@@ -380,7 +389,7 @@ jobs:
                   date_text = calendar_horizon(horizon)
                   if not date_text or not filed < date_text <= str(int(filed[:4]) + 6) + "-12-31":
                       continue
-                  evidence = section.strip()
+                  evidence = (prior + " " if referred_cash else "") + section.strip()
                   if len(evidence) > 540:
                       continue
                   candidate = {"through": date_text, "published": horizon[0], "conditional": bool(CONDITIONAL.search(evidence)),
@@ -433,7 +442,7 @@ jobs:
               accession, cik = key
               filed, form, path, _ = filing
               record = {"accession": accession, "cik": cik, "filed": filed, "form": form,
-                        "url": ARCHIVES + path, "status": "Review needed"}
+                        "url": ARCHIVES + path, "status": "Review needed", "parser": PARSER_VERSION}
               try:
                   body = fetch_slot(path).decode("utf-8", errors="replace")
               except (OSError, ValueError) as error:
@@ -467,7 +476,10 @@ jobs:
               if not seen:
                   record["issue"] = "Primary text missing"
                   return record
-              record["status"] = "Screened"
+              if re.search(r"</SEC-DOCUMENT>\s*$|</IMS-DOCUMENT>\s*$", body, re.I) or len(body) < 6_900_000:
+                  record["status"] = "Screened"
+              else:
+                  record["issue"] = "Primary text screened; the full submission exceeded the text limit"
               if records:
                   # Prefer the source that explicitly reports the most terms.
                   record["closing"] = max(records, key=lambda x: sum(x.get(field) is not None for field in
@@ -511,12 +523,20 @@ jobs:
                   cache = {}
               industry = life_science_issuers(cache, contact)
               classified = set(industry.get("ciks", []))
-              kept = {(row["accession"], row["cik"]): row for row in cache.get("filings", [])
-                      if row.get("status") == "Screened" and (row["accession"], row["cik"]) in filings}
-
               def priority(item):
                   (_, cik), (filed, _, _, matching_name) = item
                   return cik in classified or matching_name, filed
+
+              kept = {}
+              for row in cache.get("filings", []):
+                  key = row["accession"], row["cik"]
+                  if key not in filings:
+                      continue
+                  is_priority, _ = priority((key, filings[key]))
+                  if row.get("status") == "Screened" and (not is_priority or row.get("parser") == PARSER_VERSION):
+                      kept[key] = row
+                  elif row.get("issue", "").startswith("Primary text screened") and row.get("parser") == PARSER_VERSION:
+                      kept[key] = row
 
               todo = [(key, value) for key, value in sorted(filings.items(), key=priority, reverse=True) if key not in kept]
               gate = Lock()
@@ -527,7 +547,7 @@ jobs:
                   with gate:
                       time.sleep(max(0, next_request - time.monotonic()))
                       next_request = time.monotonic() + 0.37
-                  return fetch(ARCHIVES + path, contact, 7_000_000)
+                  return fetch(ARCHIVES + path, contact, 7_000_000, allow_prefix=True)
 
               with ThreadPoolExecutor(max_workers=5) as pool:
                   incoming = list(pool.map(lambda job: scan_filing(*job, fetch_slot), todo[:MAX_DOWNLOADS]))
