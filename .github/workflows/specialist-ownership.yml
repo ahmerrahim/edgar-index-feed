@@ -1,0 +1,206 @@
+name: Public biotech specialist ownership
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '28 11,16 * * 1-5'
+  push:
+    paths:
+      - '.github/workflows/specialist-ownership.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: biotech-specialist-ownership
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Verify public SEC filings and assemble ownership history
+        env:
+          SEC_EDGAR_CONTACT: ${{ secrets.SEC_EDGAR_CONTACT }}
+        run: |
+          python - --output specialist-ownership.json <<'PYTHON'
+          """Publish dated public SEC ownership filings. This job never reads portfolio data."""
+
+          import argparse
+          import datetime as dt
+          import json
+          import re
+          import time
+          import urllib.request
+          from collections import defaultdict
+          from pathlib import Path
+          from xml.etree import ElementTree as ET
+
+          MANAGERS = {
+              "1263508": "Baker Bros. Advisors",
+              "1346824": "RA Capital Management",
+              "1224962": "Perceptive Advisors",
+          }
+          ARCHIVE = "https://www.sec.gov/Archives/edgar/data"
+          SUBMISSIONS = "https://data.sec.gov/submissions"
+          ACC = re.compile(r"\d{10}-\d{2}-\d{6}")
+          CIK = re.compile(r"\d{1,10}")
+
+
+          def fetch(url, contact):
+              time.sleep(0.4)
+              headers = {"User-Agent": f"Biotech Public Ownership Archive {contact}", "Accept-Encoding": "identity"}
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req, timeout=24) as response:
+                  data = response.read(8_000_001)
+              if len(data) > 8_000_000:
+                  raise ValueError("SEC response too large")
+              return data
+
+
+          def xml(body):
+              root = ET.fromstring(body)
+              for node in root.iter():
+                  node.tag = node.tag.split("}")[-1]
+              return root
+
+
+          def local(root, key):
+              return (root.findtext(".//" + key) or "").strip()
+
+
+          def ymd(value):
+              if re.fullmatch(r"\d{2}-\d{2}-\d{4}", value):
+                  return f"{value[6:]}-{value[:2]}-{value[3:5]}"
+              return value
+
+
+          def rows(root):
+              result = defaultdict(lambda: {"shares": 0, "value": 0})
+              for n in root.findall(".//infoTable"):
+                  issuer, cusip, kind = local(n, "nameOfIssuer"), local(n, "cusip").upper(), local(n, "titleOfClass")
+                  option, units = local(n, "putCall").upper(), local(n, "sshPrnamtType")
+                  if not re.fullmatch(r"[A-Z\d]{9}", cusip) or not issuer or not kind:
+                      raise ValueError("Invalid SEC security row")
+                  key = (cusip, kind, units, option)
+                  item = result[key]
+                  item.update(issuer=issuer, cusip=cusip, kind=kind, units=units, option=option)
+                  item["shares"] += int(local(n, "sshPrnamt"))
+                  item["value"] += int(local(n, "value"))
+              return dict(result)
+
+
+          def parse_quarter(recent, i, cik, contact):
+              accession = recent["accessionNumber"][i]
+              if not ACC.fullmatch(accession):
+                  raise ValueError("Invalid filing accession")
+              folder = f"{ARCHIVE}/{cik}/{accession.replace('-', '')}"
+              primary = recent["primaryDocument"][i].rsplit("/", 1)[-1]
+              if not re.fullmatch(r"[\w.-]+\.xml", primary):
+                  raise ValueError("Unexpected SEC cover filename")
+              cover = xml(fetch(f"{folder}/{primary}", contact))
+              if recent["form"][i].endswith("/A") and local(cover, "amendmentType").upper() != "RESTATEMENT":
+                  return None
+              period = ymd(local(cover, "reportCalendarOrQuarter") or recent["reportDate"][i])
+              listing = json.loads(fetch(f"{folder}/index.json", contact))["directory"]["item"]
+              candidates = sorted((x["name"] for x in listing if re.fullmatch(r"[\w.-]+\.xml", x["name"])
+                                   and x["name"] != primary), key=lambda s: ("table" not in s.lower(), s))
+              expected = int(local(cover, "tableEntryTotal"))
+              for name in candidates:
+                  table_url = f"{folder}/{name}"
+                  table = xml(fetch(table_url, contact))
+                  if len(table.findall(".//infoTable")) != expected or not expected:
+                      continue
+                  positions = rows(table)
+                  value = int(local(cover, "tableValueTotal"))
+                  if sum(x["value"] for x in positions.values()) != value:
+                      raise ValueError("SEC values disagree with the cover page")
+                  return {"period": period, "filed": recent["filingDate"][i], "accession": accession,
+                          "url": f"{folder}/{accession}-index.htm", "table": table_url,
+                          "total": value, "position_count": expected, "positions": positions}
+              raise ValueError("No complete SEC information table")
+
+
+          def beneficial(recent, i, cik, contact):
+              accession = recent["accessionNumber"][i]
+              primary = recent["primaryDocument"][i].rsplit("/", 1)[-1]
+              if not ACC.fullmatch(accession) or not re.fullmatch(r"[\w.-]+\.xml", primary):
+                  return None
+              folder = f"{ARCHIVE}/{cik}/{accession.replace('-', '')}"
+              url = f"{folder}/{primary}"
+              root = xml(fetch(url, contact))
+              event = ymd(local(root, "dateOfEvent") or local(root, "eventDateRequiresFilingThisStatement"))
+              issuer = local(root, "issuerName")
+              if not issuer:
+                  return None
+              percentage = local(root, "percentOfClass") or local(root, "percentOfClassRepresentedByAmountInRow11")
+              return {"form": recent["form"][i], "issuer": issuer, "cik": local(root, "issuerCIK") or local(root, "issuerCik"),
+                      "event": event, "filed": recent["filingDate"][i], "accession": accession,
+                      "reported_percentage": percentage, "url": url}
+
+
+          def build(contact, as_of):
+              result = {"version": 1, "checked": as_of.isoformat(), "managers": []}
+              for cik, manager in MANAGERS.items():
+                  recent = json.loads(fetch(f"{SUBMISSIONS}/CIK{cik.zfill(10)}.json", contact))["filings"]["recent"]
+                  quarterly = {}
+                  for i, form in enumerate(recent["form"]):
+                      if form not in ("13F-HR", "13F-HR/A") or recent["reportDate"][i] in quarterly:
+                          continue
+                      quarter = parse_quarter(recent, i, cik, contact)
+                      if quarter:
+                          quarterly.setdefault(quarter["period"], quarter)
+                      if len(quarterly) == 2:
+                          break
+                  if len(quarterly) != 2:
+                      raise ValueError("Need two complete comparable SEC quarters for " + manager)
+                  latest, prior = [quarterly[d] for d in sorted(quarterly, reverse=True)]
+                  current, previous = latest.pop("positions"), prior.pop("positions")
+                  holdings = []
+                  for key in set(current) | set(previous):
+                      now, then = current.get(key), previous.get(key)
+                      ref = now or then
+                      holdings.append({**ref, "shares": now["shares"] if now else 0, "value": now["value"] if now else 0,
+                                       "prior_shares": then["shares"] if then else 0})
+                  holdings.sort(key=lambda row: (-row["value"], row["cusip"], row["kind"], row["option"]))
+                  disclosures = []
+                  earliest = (as_of - dt.timedelta(days=75)).isoformat()
+                  for i, form in enumerate(recent["form"]):
+                      if recent["filingDate"][i] < earliest or len(disclosures) >= 10:
+                          break
+                      if re.fullmatch(r"(?:SCHEDULE )?13[DG](?:/A)?", form):
+                          filing = beneficial(recent, i, cik, contact)
+                          if filing:
+                              disclosures.append(filing)
+                  result["managers"].append({"name": manager, "cik": cik, "latest": latest, "prior": prior,
+                                             "holdings": holdings, "disclosures": disclosures})
+              return result
+
+
+          def main():
+              import os
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--output", type=Path, required=True)
+              args = parser.parse_args()
+              contact = os.environ["SEC_EDGAR_CONTACT"]
+              if "@" not in contact or "\n" in contact:
+                  raise SystemExit("SEC administrative contact required")
+              result = build(contact, dt.date.today())
+              args.output.write_text(json.dumps(result, separators=(",", ":")) + "\n")
+              for manager in result["managers"]:
+                  print(manager["name"], manager["latest"]["period"], manager["latest"]["position_count"], "reported entries")
+
+
+          if __name__ == "__main__":
+              main()
+          PYTHON
+      - name: Publish validated ownership data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view specialist-ownership >/dev/null 2>&1; then
+            gh release upload specialist-ownership specialist-ownership.json --clobber
+          else
+            gh release create specialist-ownership specialist-ownership.json --title 'Public SEC specialist ownership' --notes 'Verified public 13F position changes and recent beneficial ownership filings.'
+          fi
