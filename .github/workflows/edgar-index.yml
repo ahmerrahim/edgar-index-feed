@@ -3,7 +3,7 @@ name: Refresh SEC filing index
 on:
   workflow_dispatch:
   schedule:
-    - cron: '17 10 * * *'
+    - cron: '17 10,13 * * *'
 
 permissions:
   contents: write
