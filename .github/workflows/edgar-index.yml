@@ -290,7 +290,10 @@ jobs:
 
           LOOKBACK = 9
           MAX_DOWNLOADS = 600
-          PARSER_VERSION = 3
+          PARSER_VERSION = 4
+          PACKAGE_LIMIT = 7_000_000
+          MAX_INDEX_REQUESTS = 220
+          MAX_EXHIBITS = 5
           CURRENT_FORMS = {"8-K", "6-K"}
           PERIODIC_FORMS = {"10-Q", "10-K", "20-F", "40-F"}
           ALLOWED_EXCHANGES = {"nasdaq", "nyse", "nyse american", "nyse arca", "cboe"}
@@ -438,50 +441,89 @@ jobs:
               return None
 
 
-          def scan_filing(key, filing, fetch_slot):
-              accession, cik = key
-              filed, form, path, _ = filing
-              record = {"accession": accession, "cik": cik, "filed": filed, "form": form,
-                        "url": ARCHIVES + path, "status": "Review needed", "parser": PARSER_VERSION}
-              try:
-                  body = fetch_slot(path).decode("utf-8", errors="replace")
-              except (OSError, ValueError) as error:
-                  record["issue"] = exc_status(error)
-                  return record
-              records = []
-              cash = []
-              seen = 0
-              for block in DOCUMENT.findall(body):
-                  kind = re.search(r"^<TYPE>([^\r\n]+)", block, re.M | re.I)
-                  filename = re.search(r"^<FILENAME>([^\r\n]+)", block, re.M | re.I)
-                  payload = re.search(r"<TEXT>(.*?)</TEXT>", block, re.S | re.I)
-                  if not kind or not filename or not payload:
+          class FilingIndex(HTMLParser):
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.rows = []
+                  self.row = None
+                  self.cell = None
+
+              def handle_starttag(self, tag, attrs):
+                  if tag == "tr":
+                      self.row = []
+                  elif tag == "td" and self.row is not None:
+                      self.cell = [[], ""]
+                  elif tag == "a" and self.cell is not None:
+                      self.cell[1] = dict(attrs).get("href", "")
+
+              def handle_data(self, data):
+                  if self.cell is not None:
+                      self.cell[0].append(data)
+
+              def handle_endtag(self, tag):
+                  if tag == "td" and self.cell is not None:
+                      self.row.append((" ".join(self.cell[0]).strip(), self.cell[1]))
+                      self.cell = None
+                  elif tag == "tr" and self.row is not None:
+                      self.rows.append(self.row)
+                      self.row = None
+                      self.cell = None
+
+
+          def evidence_exhibit(kind, description="", form=""):
+              return bool(re.fullmatch(r"EX-99(?:\.\d+)?", kind)) or (
+                  form.removesuffix("/A") in CURRENT_FORMS and kind.startswith("EX-10") and
+                  bool(re.search(r"purchase agreement|underwriting agreement|credit agreement|loan agreement|financing", description, re.I))
+              )
+
+
+          def official_documents(body, folder, form):
+              table = FilingIndex()
+              table.feed(body)
+              documents = {}
+              for row in table.rows:
+                  if len(row) < 4:
                       continue
-                  kind, filename = kind[1].strip().upper(), filename[1].strip()
-                  if kind != form and not re.fullmatch(r"EX-99(?:\.\d+)?", kind):
+                  kind = row[3][0].strip().upper()
+                  if kind != form and not evidence_exhibit(kind, row[1][0], form):
                       continue
-                  if not re.fullmatch(r"[A-Za-z0-9_.-]+\.(?:html?|txt)", filename):
+                  href = row[2][1]
+                  path = href.split("?doc=", 1)[-1] if "?doc=" in href else href
+                  local = "/Archives/" + folder
+                  if not path.startswith(local):
                       continue
-                  if kind == form:
-                      seen += 1
-                  url = f"{ARCHIVES}edgar/data/{cik}/{accession.replace('-', '')}/{filename}"
+                  filename = path[len(local):].split("?", 1)[0]
+                  if not re.fullmatch(r"[A-Za-z0-9_.-]+", filename):
+                      continue
+                  documents[(kind, filename)] = row[1][0]
+              return list(documents)
+
+
+          def apply_documents(record, contents, folder, missing):
+              records, cash, names = [], [], []
+              form = record["form"]
+              for (kind, filename), payload in contents.items():
                   parser = FilingText()
-                  parser.feed(payload[1])
+                  parser.feed(payload)
                   text = parser.text().replace("’", "'")
+                  if not text:
+                      missing.append(kind + " " + filename + " has no readable text")
+                      continue
+                  url = ARCHIVES + folder + filename
+                  names.append({"type": kind, "file": filename, "url": url})
                   if form.removesuffix("/A") in CURRENT_FORMS:
                       terms = closed_terms(text)
                       if terms:
                           records.append({"url": url, **terms})
-                  cash.extend({"url": url, **term} for term in runway_terms(text, filed))
-              if not seen:
-                  record["issue"] = "Primary text missing"
-                  return record
-              if re.search(r"</SEC-DOCUMENT>\s*$|</IMS-DOCUMENT>\s*$", body, re.I) or len(body) < 6_900_000:
-                  record["status"] = "Screened"
+                  cash.extend({"url": url, **term} for term in runway_terms(text, record["filed"]))
+              record["documents"] = names
+              if not any(item["type"] == form for item in names):
+                  missing.insert(0, "Primary text unavailable")
+              if missing:
+                  record["issue"] = "; ".join(dict.fromkeys(missing))[:330]
               else:
-                  record["issue"] = "Primary text screened; the full submission exceeded the text limit"
+                  record["status"] = "Screened"
               if records:
-                  # Prefer the source that explicitly reports the most terms.
                   record["closing"] = max(records, key=lambda x: sum(x.get(field) is not None for field in
                                            ("gross", "net", "common", "warrants", "prior_shares")))
               horizons = {item["through"] for item in cash}
@@ -490,6 +532,66 @@ jobs:
               elif horizons:
                   record["runway_review"] = "More than one explicit runway horizon in the filing and exhibits"
               return record
+
+
+          def scan_filing(key, filing, fetch_slot, fetch_index_piece, already_oversize=False):
+              accession, cik = key
+              filed, form, path, _ = filing
+              folder = f"edgar/data/{cik}/{accession.replace('-', '')}/"
+              record = {"accession": accession, "cik": cik, "filed": filed, "form": form,
+                        "url": ARCHIVES + folder + accession + "-index.htm", "status": "Review needed",
+                        "parser": PARSER_VERSION}
+              contents, missing = {}, []
+              if not already_oversize:
+                  try:
+                      raw = fetch_slot(path, PACKAGE_LIMIT, True)
+                      for block in DOCUMENT.findall(raw.decode("utf-8", errors="replace")):
+                          kind = re.search(r"^<TYPE>([^\r\n]+)", block, re.M | re.I)
+                          filename = re.search(r"^<FILENAME>([^\r\n]+)", block, re.M | re.I)
+                          payload = re.search(r"<TEXT>(.*?)</TEXT>", block, re.S | re.I)
+                          if not kind or not filename or not payload:
+                              continue
+                          kind, filename = kind[1].strip().upper(), filename[1].strip()
+                          if kind != form and not evidence_exhibit(kind, form=form):
+                              continue
+                          if re.fullmatch(r"[A-Za-z0-9_.-]+\.(?:html?|txt)", filename, re.I):
+                              contents[(kind, filename)] = payload[1]
+                          else:
+                              missing.append(kind + " " + filename + " is not supported text")
+                      if len(raw) <= PACKAGE_LIMIT and any(kind == form for kind, _ in contents):
+                          record["method"] = "Full submission"
+                          return apply_documents(record, contents, folder, missing)
+                  except (OSError, ValueError) as error:
+                      missing.append("Full submission " + exc_status(error))
+              record["method"] = "Individual SEC documents"
+              try:
+                  page = fetch_index_piece(folder + accession + "-index.htm", 2_000_000)
+                  docs = official_documents(page.decode("utf-8", errors="replace"), folder, form)
+                  primary = [item for item in docs if item[0] == form]
+                  exhibits = [item for item in docs if item[0] != form]
+                  if not primary:
+                      raise ValueError("SEC index did not list a primary document")
+              except (OSError, ValueError) as error:
+                  missing.append("Individual documents unavailable: " + (str(error) if isinstance(error, ValueError) else exc_status(error)))
+                  return apply_documents(record, contents, folder, missing)
+              # The official index now defines the evidence set. Keep any complete
+              # package documents already read and fetch each missing selected item.
+              missing = []
+              selected = primary + exhibits[:MAX_EXHIBITS]
+              if len(exhibits) > MAX_EXHIBITS:
+                  missing.append(str(len(exhibits) - MAX_EXHIBITS) + " additional relevant exhibits not yet screened")
+              for doc in selected:
+                  if doc in contents:
+                      continue
+                  kind, filename = doc
+                  if not re.search(r"\.(?:html?|txt)$", filename, re.I):
+                      missing.append(kind + " " + filename + " is not supported text")
+                      continue
+                  try:
+                      contents[doc] = fetch_index_piece(folder + filename, 5_000_000).decode("utf-8", errors="replace")
+                  except (OSError, ValueError) as error:
+                      missing.append(kind + " " + filename + ": " + (str(error) if isinstance(error, ValueError) else exc_status(error)))
+              return apply_documents(record, {doc: contents[doc] for doc in selected if doc in contents}, folder, missing)
 
 
           def life_science_issuers(cache, contact):
@@ -527,36 +629,57 @@ jobs:
                   (_, cik), (filed, _, _, matching_name) = item
                   return cik in classified or matching_name, filed
 
-              kept = {}
+              kept, previous_oversize = {}, set()
               for row in cache.get("filings", []):
                   key = row["accession"], row["cik"]
                   if key not in filings:
                       continue
-                  is_priority, _ = priority((key, filings[key]))
-                  if row.get("status") == "Screened" and (not is_priority or row.get("parser") == PARSER_VERSION):
+                  if row.get("status") == "Screened":
                       kept[key] = row
-                  elif row.get("issue", "").startswith("Primary text screened") and row.get("parser") == PARSER_VERSION:
-                      kept[key] = row
+                  elif row.get("issue", "").startswith("Primary text screened"):
+                      previous_oversize.add(key)
 
-              todo = [(key, value) for key, value in sorted(filings.items(), key=priority, reverse=True) if key not in kept]
+              backlog = [(key, filings[key]) for key in previous_oversize]
+              backlog.sort(key=lambda pair: (not priority(pair)[0], pair[1][0], pair[0]))
+              ordinary = [(key, value) for key, value in sorted(filings.items(), key=priority, reverse=True)
+                          if key not in kept and key not in previous_oversize]
+              todo = backlog + ordinary
               gate = Lock()
-              next_request = 0.0
+              next_request, index_count = 0.0, 0
 
-              def fetch_slot(path):
+              def fetch_slot(path, cap, allow_prefix=False):
                   nonlocal next_request
                   with gate:
                       time.sleep(max(0, next_request - time.monotonic()))
                       next_request = time.monotonic() + 0.37
-                  return fetch(ARCHIVES + path, contact, 7_000_000, allow_prefix=True)
+                  return fetch(ARCHIVES + path, contact, cap, allow_prefix)
+
+              def fetch_index_piece(path, cap):
+                  nonlocal index_count
+                  with gate:
+                      if index_count >= MAX_INDEX_REQUESTS:
+                          raise ValueError("Daily individual-document budget reached")
+                      index_count += 1
+                  return fetch_slot(path, cap)
+
+              def visit(job):
+                  key, value = job
+                  return scan_filing(key, value, fetch_slot, fetch_index_piece, key in previous_oversize)
 
               with ThreadPoolExecutor(max_workers=5) as pool:
-                  incoming = list(pool.map(lambda job: scan_filing(*job, fetch_slot), todo[:MAX_DOWNLOADS]))
+                  incoming = list(pool.map(visit, todo[:MAX_DOWNLOADS]))
+              print(f"{index_count} separate SEC index and document requests.")
               kept.update({(row["accession"], row["cik"]): row for row in incoming})
+              queued = { (row["accession"], row["cik"]): row for row in cache.get("filings", []) if row.get("status") == "Review needed" }
               for key, (filed, form, path, _) in todo[MAX_DOWNLOADS:]:
+                  if key in queued:
+                      kept[key] = queued[key]
+                      continue
                   kept[key] = {"accession": key[0], "cik": key[1], "filed": filed, "form": form,
                                "url": ARCHIVES + path, "status": "Queued"}
               records = list(kept.values())
               screened = sum(row["status"] == "Screened" for row in records)
+              print(f"{sum(row.get('method') == 'Individual SEC documents' and row['status'] == 'Screened' for row in records)} filings fully screened through individual SEC documents.")
               print(f"Life sciences priority: {len(classified)} SEC industry classifications from {industry.get('quarter', 'no quarter')}.")
               return {"version": 2, "industry": industry, "start": start, "through": source["published"], "missing": source.get("missing", []),
                       "filings": records, "eligible": len(records), "screened": screened,
