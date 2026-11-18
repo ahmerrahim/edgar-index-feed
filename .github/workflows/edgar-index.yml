@@ -29,6 +29,7 @@ jobs:
           from datetime import date, datetime, timedelta, timezone
           import gzip
           import io
+          import json
           import re
           from pathlib import Path
           import urllib.error
@@ -73,11 +74,26 @@ jobs:
               return body
 
 
+          def published_days(start, today, contact):
+              base = "https://www.sec.gov/Archives/edgar/daily-index/"
+              quarters = {(day.year, (day.month - 1) // 3 + 1) for day in (start, today)}
+              days = set()
+              for year, quarter in sorted(quarters):
+                  folder = download(f"{base}{year}/QTR{quarter}/", contact)
+                  matches = re.findall(rb"\bmaster\.(\d{8})\.idx\b", folder)
+                  days.update(datetime.strptime(day.decode(), "%Y%m%d").date() for day in matches)
+              recent = {day for day in days if start <= day <= today}
+              if not recent:
+                  raise ValueError("No published master files found in the SEC daily index directory")
+              return recent
+
+
           def parse_archive(body, start, today):
               """Validate the SEC header and retain the forms the two Sheets jobs use."""
               records = {}
               seen_header = False
               through = date.min
+              filing_days = set()
               with gzip.GzipFile(fileobj=io.BytesIO(body)) as compressed:
                   stream = io.TextIOWrapper(compressed, encoding="utf-8", errors="replace")
                   for raw in stream:
@@ -100,12 +116,14 @@ jobs:
                       if filed_date > today:
                           raise ValueError("SEC index contains a future filing date")
                       through = max(through, filed_date)
+                      if filed_date >= start:
+                          filing_days.add(filed_date)
                       if filed_date < start or not FORM.fullmatch(form):
                           continue
                       records[(path.lower(), cik, form)] = (cik, issuer, form, filed_date.isoformat(), path)
               if not seen_header or through == date.min:
                   raise ValueError("SEC master index header or filings missing")
-              return through, records
+              return through, records, filing_days
 
 
           def main():
@@ -116,6 +134,7 @@ jobs:
               args = parser.parse_args()
               start = args.as_of - timedelta(days=45)
               if args.source:
+                  published = set()
                   sources = (p.read_bytes() for p in args.source)
               else:
                   contact = os.environ.get("SEC_EDGAR_CONTACT", "").strip()
@@ -124,18 +143,27 @@ jobs:
                   preceding = previous_archive(start, args.as_of)
                   urls = [preceding, ARCHIVES + "master.gz"] if preceding else [ARCHIVES + "master.gz"]
                   sources = (download(url, contact) for url in urls)
+                  published = published_days(start, args.as_of, contact)
 
               through = date.min
               records = {}
+              filing_days = set()
               for source in sources:
-                  filed_through, items = parse_archive(source, start, args.as_of)
+                  filed_through, items, dates = parse_archive(source, start, args.as_of)
                   through = max(through, filed_through)
                   records.update(items)
+                  filing_days.update(dates)
               if through < args.as_of - timedelta(days=6) or not records:
                   raise SystemExit("SEC index is stale or contains no matching filing forms")
 
               ordered = sorted(records.values(), key=lambda row: (row[3], row[0], row[4], row[2]))
-              prefix = f"EDGAR source: {ARCHIVES}master.gz\nEDGAR coverage: {start}|{through}\n{HEADER}\n"
+              source = {
+                  "url": ARCHIVES + "master.gz",
+                  "checked": args.as_of.isoformat() if published else "",
+                  "published": max(published).isoformat() if published else "",
+                  "missing": [day.isoformat() for day in sorted(published - filing_days)],
+              }
+              prefix = f"EDGAR source: {json.dumps(source, separators=(',', ':'))}\nEDGAR coverage: {start}|{through}\n{HEADER}\n"
               payload = prefix + "".join("|".join(record) + "\n" for record in ordered)
               compressed = gzip.compress(payload.encode("utf-8"), mtime=0)
               args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -167,3 +195,4 @@ jobs:
             git commit -m 'Record refreshed public EDGAR index'
             git push
           fi
+
