@@ -70,6 +70,7 @@ jobs:
 
 
           def ymd(value):
+              value = value.replace("/", "-")
               if re.fullmatch(r"\d{2}-\d{2}-\d{4}", value):
                   return f"{value[6:]}-{value[:2]}-{value[3:5]}"
               return value
@@ -133,7 +134,7 @@ jobs:
               issuer = local(root, "issuerName")
               if not issuer:
                   return None
-              percentage = local(root, "percentOfClass") or local(root, "percentOfClassRepresentedByAmountInRow11")
+              percentage = local(root, "percentOfClass") or local(root, "classPercent") or local(root, "percentOfClassRepresentedByAmountInRow11")
               return {"form": recent["form"][i], "issuer": issuer, "cik": local(root, "issuerCIK") or local(root, "issuerCik"),
                       "event": event, "filed": recent["filingDate"][i], "accession": accession,
                       "reported_percentage": percentage, "url": url}
