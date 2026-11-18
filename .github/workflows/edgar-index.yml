@@ -211,10 +211,12 @@ jobs:
           """Publish public SEC issuer identifiers and explicit recent financing terms."""
 
           from calendar import monthrange
+          from csv import DictReader
           from datetime import date, datetime, timedelta, timezone
           from gzip import open as gzip_open
           from html import unescape
           from html.parser import HTMLParser
+          from io import BytesIO, TextIOWrapper
           import json
           import os
           from pathlib import Path
@@ -223,6 +225,7 @@ jobs:
           from concurrent.futures import ThreadPoolExecutor
           from threading import Lock
           from urllib.request import Request, urlopen
+          from zipfile import ZipFile, BadZipFile
 
 
           TODAY = datetime.now(timezone.utc).date()
@@ -290,6 +293,8 @@ jobs:
           CURRENT_FORMS = {"8-K", "6-K"}
           PERIODIC_FORMS = {"10-Q", "10-K", "20-F", "40-F"}
           ALLOWED_EXCHANGES = {"nasdaq", "nyse", "nyse american", "nyse arca", "cboe"}
+          LIFE_SCIENCE_CODES = {"2833", "2834", "2835", "2836", "3826", "3841", "3845", "8071", "8731"}
+          LIFE_SCIENCE_NAME = re.compile(r"bio(?:tech|science|pharm)|therapeutic|pharmaceutical|oncolog|immunolog|gene therap", re.I)
           FILING_PATH = re.compile(r"edgar/data/\d+/\d{10}-\d{2}-\d{6}\.txt", re.I)
           DOCUMENT = re.compile(r"<DOCUMENT>\s*(.*?)</DOCUMENT>", re.I | re.S)
           MONTHS = "January February March April May June July August September October November December".split()
@@ -320,13 +325,13 @@ jobs:
                   next(archive)
                   next(archive)
                   for line in archive:
-                      cik, _, form, filed, path = line.strip().split("|")
+                      cik, issuer, form, filed, path = line.strip().split("|")
                       if cik not in listed or filed < cutoff or filed > source["published"] or not FILING_PATH.fullmatch(path):
                           continue
                       if form.removesuffix("/A") not in CURRENT_FORMS | PERIODIC_FORMS:
                           continue
                       accession = Path(path).stem
-                      filings.setdefault((accession, cik), (filed, form, path))
+                      filings.setdefault((accession, cik), (filed, form, path, bool(LIFE_SCIENCE_NAME.search(issuer))))
               return source, cutoff, filings
 
 
@@ -426,7 +431,7 @@ jobs:
 
           def scan_filing(key, filing, fetch_slot):
               accession, cik = key
-              filed, form, path = filing
+              filed, form, path, _ = filing
               record = {"accession": accession, "cik": cik, "filed": filed, "form": form,
                         "url": ARCHIVES + path, "status": "Review needed"}
               try:
@@ -475,6 +480,26 @@ jobs:
               return record
 
 
+          def life_science_issuers(cache, contact):
+              quarter_end = TODAY.replace(month=((TODAY.month - 1) // 3) * 3 + 1, day=1) - timedelta(days=1)
+              quarter = f"{quarter_end.year}q{(quarter_end.month - 1) // 3 + 1}"
+              saved = cache.get("industry", {})
+              if saved.get("quarter") == quarter and len(saved.get("ciks", [])) >= 100:
+                  return saved
+              url = f"https://www.sec.gov/files/dera/data/financial-statement-data-sets/{quarter}.zip"
+              try:
+                  body = fetch(url, contact, 180_000_000)
+                  with ZipFile(BytesIO(body)) as archive, archive.open("sub.txt") as raw:
+                      submissions = DictReader(TextIOWrapper(raw, encoding="utf-8-sig", errors="replace"), delimiter="\t")
+                      ciks = sorted({row["cik"].lstrip("0") for row in submissions if row.get("sic") in LIFE_SCIENCE_CODES})
+                  if len(ciks) < 100:
+                      raise ValueError("Quarterly SIC dataset has too few life sciences issuers")
+                  return {"quarter": quarter, "ciks": ciks}
+              except (OSError, ValueError, KeyError, BadZipFile) as problem:
+                  print("SEC life sciences classification will retry:", exc_status(problem))
+                  return saved
+
+
           def review(issuers, contact):
               source, start, filings = latest_accessions(issuers)
               previous = Path("/tmp/previous-edgar-reference.json")
@@ -484,10 +509,16 @@ jobs:
                       cache = {}
               except (OSError, ValueError):
                   cache = {}
+              industry = life_science_issuers(cache, contact)
+              classified = set(industry.get("ciks", []))
               kept = {(row["accession"], row["cik"]): row for row in cache.get("filings", [])
                       if row.get("status") == "Screened" and (row["accession"], row["cik"]) in filings}
-              todo = [(key, value) for key, value in sorted(filings.items(), key=lambda pair: pair[1][0], reverse=True)
-                      if key not in kept]
+
+              def priority(item):
+                  (_, cik), (filed, _, _, matching_name) = item
+                  return cik in classified or matching_name, filed
+
+              todo = [(key, value) for key, value in sorted(filings.items(), key=priority, reverse=True) if key not in kept]
               gate = Lock()
               next_request = 0.0
 
@@ -501,12 +532,13 @@ jobs:
               with ThreadPoolExecutor(max_workers=5) as pool:
                   incoming = list(pool.map(lambda job: scan_filing(*job, fetch_slot), todo[:MAX_DOWNLOADS]))
               kept.update({(row["accession"], row["cik"]): row for row in incoming})
-              for key, (filed, form, path) in todo[MAX_DOWNLOADS:]:
+              for key, (filed, form, path, _) in todo[MAX_DOWNLOADS:]:
                   kept[key] = {"accession": key[0], "cik": key[1], "filed": filed, "form": form,
                                "url": ARCHIVES + path, "status": "Queued"}
               records = list(kept.values())
               screened = sum(row["status"] == "Screened" for row in records)
-              return {"version": 2, "start": start, "through": source["published"], "missing": source.get("missing", []),
+              print(f"Life sciences priority: {len(classified)} SEC industry classifications from {industry.get('quarter', 'no quarter')}.")
+              return {"version": 2, "industry": industry, "start": start, "through": source["published"], "missing": source.get("missing", []),
                       "filings": records, "eligible": len(records), "screened": screened,
                       "pending": len(records) - screened, "requests": len(incoming)}
 
